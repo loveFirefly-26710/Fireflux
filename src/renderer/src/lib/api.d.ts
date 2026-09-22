@@ -6,11 +6,13 @@ import type {
 	AppearanceSettings,
 	AppSettingsInfo,
 	BranchInfo,
+	ConfigExportData,
 	ConfigReadResult,
 	ContentItem,
 	DataDirInfo,
 	DiscoveredConfig,
 	GitStatus,
+	GpuStatus,
 	LogEntry,
 	MergeResult,
 	NetworkFailure,
@@ -21,11 +23,13 @@ export type {
 	AppearanceSettings,
 	AppSettingsInfo,
 	BranchInfo,
+	ConfigExportData,
 	ConfigReadResult,
 	ContentItem,
 	DataDirInfo,
 	DiscoveredConfig,
 	GitStatus,
+	GpuStatus,
 	LogEntry,
 	MergeResult,
 	NetworkFailure,
@@ -98,7 +102,8 @@ export interface WindowApi {
 	appearanceClearWallpaper(): Promise<AppearanceSettings>
 	appearanceWallpaperData(): Promise<string | null>
 
-	gpuStatus(): Promise<boolean>
+	gpuStatus(): Promise<GpuStatus>
+	onGpuStatus(cb: (status: GpuStatus) => void): () => void
 	gpuSet(on: boolean): Promise<boolean>
 
 	/** 内嵌网页（Memos）最近的请求失败与证书错误，用于动态页的「连接诊断」 */

@@ -76,6 +76,7 @@
 
 	const groupFields = $derived(byAuto(def?.fields ?? [], value))
 	const listFields = $derived(byAuto(def?.item ?? [], firstItem(value)))
+	const arrayValue = $derived.by((): unknown[] => (Array.isArray(value) ? value : []))
 
 	function itemTitle(item: unknown, i: number): string {
 		const key = def?.titleKey ?? 'name'
@@ -159,7 +160,7 @@
 {#if adv}
 	<div class="field">
 		{#if !bare}<span class="flabel">{label}</span>{/if}
-		<div class="adv-box">{value.__adv}</div>
+		<div class="adv-box">{isAdv(value) ? value.__adv : ''}</div>
 		<div class="hint">此项由代码生成或为引用，暂不支持图形化修改（可在博客源文件中手动修改）。</div>
 	</div>
 {:else if widget === 'bool'}
@@ -207,7 +208,7 @@
 			{:else}
 				<Self def={{ k: def.k, w: 'stringList', asset: def.asset }} value={value} {path} {labels} oninput={oninput} />
 			{/if}
-		{:else if dualShape === 'bool'}
+		{:else if dualShape === 'bool' && def}
 			<Self def={{ k: def.k, w: 'bool' }} value={value} {path} {labels} oninput={oninput} />
 		{:else}
 			{#each def?.dualFields ?? [] as f}
@@ -253,7 +254,7 @@
 {:else if widget === 'stringList'}
 	<div class="field">
 		<span class="flabel">{label}</span>
-		{#each value as item, i}
+		{#each arrayValue as item, i}
 			<div class="row" style="margin-bottom:6px">
 				<input value={String(item)} oninput={(e) => setAt(i, (e.target as HTMLInputElement).value)} />
 				{#if def?.asset}
@@ -268,13 +269,13 @@
 {:else if widget === 'list'}
 	<div class="field">
 		<span class="flabel">{label}</span>
-		{#each value as item, i}
+		{#each arrayValue as item, i}
 			<div class="list-card">
 				<div class="list-card-head">
 					<b>{itemTitle(item, i)}</b>
 					<div class="row">
 						<button class="btn small" disabled={i === 0} onclick={() => move(i, -1)}>↑</button>
-						<button class="btn small" disabled={i === (value as unknown[]).length - 1} onclick={() => move(i, 1)}>↓</button>
+						<button class="btn small" disabled={i === arrayValue.length - 1} onclick={() => move(i, 1)}>↓</button>
 						<button class="btn small danger" onclick={() => removeAt(i)}>删除</button>
 					</div>
 				</div>

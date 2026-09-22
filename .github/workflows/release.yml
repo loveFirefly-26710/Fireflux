@@ -13,26 +13,24 @@ permissions:
 
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: true
+  # 发布/打包不可被后续推送中断；新发布排队等待当前 NSIS/ZIP 完成。
+  cancel-in-progress: false
 
 jobs:
   windows-release:
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
-      - name: 安装 pnpm
-        uses: pnpm/action-setup@v4
+      - name: 安装 pnpm 与 Node
+        uses: pnpm/setup@v3
         with:
           version: 11
-
-      - name: 安装 Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: pnpm
+          runtime: node@22
+          cache: true
+          install: false
 
       - name: 安装依赖
         run: pnpm install --frozen-lockfile
@@ -40,32 +38,67 @@ jobs:
       - name: 类型检查
         run: pnpm typecheck
 
+      - name: 检查 Svelte 组件
+        run: pnpm check:svelte
+
+      - name: 运行渲染调度回归测试
+        run: pnpm test:rendering
+
       # dist 脚本里必须带 --publish never：CI 环境下 electron-builder 会默认「顺手发布」到
       # GitHub 并要求 GH_TOKEN，和下面的 softprops 步骤重复，还会让整个 job 直接失败
-      - name: 构建并打 Windows 安装包（NSIS）
-        run: pnpm dist
-
-      - name: 读取版本号
+      - name: 计算发布版本
         id: pkg
         shell: bash
         run: |
-          VERSION=$(node -p "require('./package.json').version")
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            # 将运行号按十进制进位映射到三段版本号：
+            # run 1..9 -> 0.1.1..0.1.9，run 10 -> 0.2.0，run 11 -> 0.2.1。
+            SERIAL=$((GITHUB_RUN_NUMBER + 10))
+            if (( SERIAL > 999 )); then
+              echo "运行号过大，无法保持三段版本号每段都在 0~9：$GITHUB_RUN_NUMBER"
+              exit 1
+            fi
+            MAJOR=$((SERIAL / 100))
+            MINOR=$(((SERIAL / 10) % 10))
+            PATCH=$((SERIAL % 10))
+            VERSION="$MAJOR.$MINOR.$PATCH"
+          fi
+          if [[ ! "$VERSION" =~ ^[0-9]\.[0-9]\.[0-9]$ ]]; then
+            echo "版本号必须是三段单数字十进制版本，例如 0.2.1，当前为：$VERSION"
+            exit 1
+          fi
+          node - "$VERSION" <<'NODE'
+          const fs = require('node:fs')
+          const version = process.argv[2]
+          const packageJson = JSON.parse(fs.readFileSync('package.json', 'utf8'))
+          packageJson.version = version
+          fs.writeFileSync('package.json', JSON.stringify(packageJson, null, '\t') + '\n')
+          NODE
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "本次发版版本：v$VERSION"
 
-      - name: 上传安装包（Actions 页面留档，7 天后过期）
-        uses: actions/upload-artifact@v4
+      - name: 构建并打 Windows 安装包（NSIS）
+        run: pnpm dist
+
+      - name: 上传 Windows 安装包与便携 ZIP（Actions 页面留档，7 天后过期）
+        uses: actions/upload-artifact@v6
         with:
-          name: fireflux-${{ steps.pkg.outputs.version }}-setup
-          path: release/*.exe
+          name: fireflux-${{ steps.pkg.outputs.version }}-windows
+          path: |
+            release/*.exe
+            release/*.zip
           retention-days: 7
 
       - name: 创建 / 更新 Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: v${{ steps.pkg.outputs.version }}
           name: Fireflux v${{ steps.pkg.outputs.version }}
-          files: release/*.exe
+          files: |
+            release/*.exe
+            release/*.zip
           generate_release_notes: true
           make_latest: true
           draft: false

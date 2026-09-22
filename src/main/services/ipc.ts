@@ -18,6 +18,7 @@ import {
 } from './files'
 import { plantumlImageUrl } from './plantuml'
 import { networkFailures } from './webdiag'
+import { getGpuStatus } from './rendering'
 import {
 	addAll,
 	branchCreate,
@@ -43,10 +44,10 @@ import {
 	bindProject,
 	changeDataDir,
 	clearWallpaper,
+	clearHardwareGpuMarker,
 	dataDirInfo,
 	getAppearance,
 	getProject,
-	getSettings,
 	isValidProject,
 	pickWallpaper,
 	setAppearance,
@@ -113,9 +114,11 @@ export function registerIpc(): void {
 	ipcMain.handle('appearance:clear-wallpaper', () => clearWallpaper())
 	ipcMain.handle('appearance:wallpaper-data', () => wallpaperDataUrl())
 	// 硬件加速渲染（实验）：写入设置后重启应用生效；驱动崩溃时下次启动自动回退
-	ipcMain.handle('gpu:status', () => getSettings().hardwareGpu === true)
+	ipcMain.handle('gpu:status', () => getGpuStatus())
 	ipcMain.handle('gpu:set', (_e, on: boolean) => {
 		setHardwareGpu(!!on)
+		// 主动重启不应被下次启动误判为崩溃；app.exit 不保证窗口关闭事件执行。
+		clearHardwareGpuMarker()
 		app.relaunch()
 		app.exit(0)
 		return true

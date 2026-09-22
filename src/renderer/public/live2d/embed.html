@@ -57,12 +57,13 @@
 			// ③ 外链交给管理器用系统浏览器打开
 			embed: true,
 			controlsGutter: 40,
-			// 管理器走 SwiftShader 软件渲染，MSAA 抗锯齿每帧都是纯 CPU 开销，关闭
+			// 软件模式关闭 MSAA 并限制到 60 帧；硬件模式不加软件帧率门控。
 			antialias: false,
-			// 渲染帧率固定 15 帧（软件渲染下帧率≈CPU 占用；管理器侧的帧率开关已按要求移除）
-			maxFPS: 15,
-			// 渲染分辨率（0.4~2），调低省 CPU
-			resolution: qp('res', 1),
+			hardware: qp('hw', 0) === 1,
+			maxFPS: 60,
+			// 明确传入 res 时保留开发诊断的分辨率覆盖。
+			resolution: qp('res', qp('hw', 0) === 1 ? Math.min(2, window.devicePixelRatio || 1) : 0.8),
+			resolutionOverride: new URLSearchParams(location.search).has('res'),
 			// 物理仿真（头发/衣摆摆动）：实测是 CPU 大头，可由管理器关闭省电
 			physics: qp('phys', 1),
 			pageTitleMessage: false,
@@ -115,8 +116,11 @@
 			}
 
 			window.addEventListener('message', function (e) {
+				if (e.source !== window.parent) return
 				var d = e.data || {}
-				if (d.type === 'ff-view') {
+				if (d.type === 'ff-render-mode') {
+					if (l4ready()) window.FireflyLive2D.setRenderMode(!!d.hardware)
+				} else if (d.type === 'ff-view') {
 					window.__ffView = { s: d.s, x: d.x, y: d.y }
 					apply()
 				} else if (d.type === 'ff-pause') {

@@ -1,6 +1,7 @@
 import { BrowserWindow, Menu, app } from 'electron'
 import path from 'node:path'
 import { registerIpc } from './services/ipc'
+import { installGpuStatusUpdates } from './services/rendering'
 import { clearGpuCaches, clearHardwareGpuMarker, portableDataRoot, resolveHardwareGpu } from './services/settings'
 import { installNetworkDiagnostics, installWebviewGuards } from './services/webdiag'
 
@@ -108,6 +109,7 @@ app.whenReady().then(() => {
 	installNetworkDiagnostics()
 	installWebviewGuards()
 	registerIpc()
+	installGpuStatusUpdates()
 	createWindow()
 	// GPU 能力诊断（设置 FF_GPU_INFO=1 时输出，用于判断硬件加速是否真正生效）
 	if (process.env['FF_GPU_INFO']) {

@@ -1,4 +1,5 @@
 import { contextBridge, ipcRenderer } from 'electron'
+import type { GpuStatus } from '../shared/types'
 
 /**
  * 关键防线：Svelte 的 $state 是代理对象，Electron IPC 的结构化克隆无法处理代理，
@@ -79,7 +80,12 @@ const api = {
 	appearanceClearWallpaper: (): Promise<unknown> => invoke('appearance:clear-wallpaper'),
 	appearanceWallpaperData: (): Promise<string | null> => invoke<string | null>('appearance:wallpaper-data'),
 
-	gpuStatus: (): Promise<boolean> => invoke<boolean>('gpu:status'),
+	gpuStatus: (): Promise<GpuStatus> => invoke<GpuStatus>('gpu:status'),
+	onGpuStatus: (cb: (status: GpuStatus) => void): (() => void) => {
+		const listener = (_e: Electron.IpcRendererEvent, status: GpuStatus): void => cb(status)
+		ipcRenderer.on('gpu:changed', listener)
+		return () => { ipcRenderer.removeListener('gpu:changed', listener) }
+	},
 	gpuSet: (on: boolean): Promise<boolean> => invoke<boolean>('gpu:set', on),
 
 	/** 内嵌网页的请求失败/证书错误清单（动态页「连接诊断」用） */

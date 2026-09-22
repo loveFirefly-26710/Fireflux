@@ -21,7 +21,7 @@
 
 	/** 本地图片 → data URL（带缓存） */
 	function fillImages(el: HTMLElement): void {
-		el.querySelectorAll('img[data-local]').forEach((img) => {
+		el.querySelectorAll<HTMLImageElement>('img[data-local]').forEach((img) => {
 			const path = img.getAttribute('data-local') ?? ''
 			if (!path) return
 			const cached = imgCache.get(path)
@@ -99,7 +99,7 @@
 
 	// 内容变化后：先填图片和 ANSI，再防抖渲染图表
 	$effect(() => {
-		const html = view.html
+		void view.html
 		const el = wrap
 		if (!el) return
 		fillImages(el)

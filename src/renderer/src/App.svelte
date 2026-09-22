@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { setContext } from 'svelte'
+	import { onMount, setContext } from 'svelte'
 	import { errMsg } from './lib/err'
 	import ContentManager from './components/ContentManager.svelte'
 	import ConfigCenter from './pages/ConfigCenter.svelte'
@@ -8,11 +8,15 @@
 	import Publish from './pages/Publish.svelte'
 	import Settings from './pages/Settings.svelte'
 	import { bakeBackground } from './lib/bg-bake'
-	import type { AppearanceSettings } from './lib/api'
+	import type { AppearanceSettings, GpuStatus } from './lib/api'
 
 	let phase = $state<'loading' | 'onboard' | 'ready'>('loading')
 	let page = $state('dynamics')
 	let appearance = $state<AppearanceSettings>({})
+	let gpuStatus = $state<GpuStatus>({ requestedHardware: false, webgl: 'unknown', compositing: 'unknown', renderer: '' })
+	const hardwareLive2d = $derived(gpuStatus.webgl === 'hardware')
+	const hardwareUi = $derived(gpuStatus.compositing === 'hardware')
+	const globalFollow = $derived(appearance.live2dGlobalFollow ?? hardwareLive2d)
 	let wallpaperData = $state<string | null>(null)
 	let live2dView = $state({ s: 1, x: 0, y: 0 })
 	let live2dSrc = $state('live2d/embed.html?s=1&x=0&y=0')
@@ -34,9 +38,9 @@
 	// 三档状态，由管理器通过消息驱动 iframe：
 	// - 暂停（ff-pause）：窗口缩放中 / 拖拽分隔条中 / 窗口失焦（含最小化）→ 一帧都不排
 	// - 流畅（ff-live）：鼠标在窗口里移动、指针停在看板娘上、刚点击互动过 → 逐帧渲染
-	//   （帧率 15，指针移动期间 iframe 内部会临时提到 30，见 firefly-loader.js）
+	//   （GPU 模式不设人工帧率上限；CPU 模式最高 60 帧，默认只响应看板娘区域）
 	// - 静止肖像（ff-static）：上面都不成立时渲染最后一帧后完全停住，CPU 归零
-	const LIVE_GRACE_MS = 8000 // 指针停在侧栏（正看着它）时继续保持流畅动画的时间
+	const LIVE_GRACE_MS = 1500 // 短暂保活，点击动作另有独立尾随时间
 	// 完全暂停的来源（拖拽 / 窗口缩放 / 失焦）各自独立标记，避免互相覆盖
 	let pausedByDrag = false
 	let pausedByResize = false
@@ -60,9 +64,11 @@
 	// 每帧从三次绘制降到一次 blit；原理与实测数字见 lib/bg-bake.ts
 	let bakedBg = $state<string | null>(null)
 	let bakedKey = ''
+	let bakeGeneration = 0
 	let bakeTimer: ReturnType<typeof setTimeout> | undefined
 	async function bakeBg(): Promise<void> {
 		const src = wallpaperData
+		const generation = ++bakeGeneration
 		if (!src) {
 			if (bakedBg) URL.revokeObjectURL(bakedBg)
 			bakedBg = null
@@ -78,7 +84,7 @@
 			height: window.innerHeight,
 			dpr: window.devicePixelRatio || 1
 		})
-		if (src !== wallpaperData) {
+		if (generation !== bakeGeneration || src !== wallpaperData) {
 			if (url) URL.revokeObjectURL(url)
 			return
 		}
@@ -88,6 +94,13 @@
 	}
 
 	function setLive2dPaused(paused: boolean): void {
+		if (paused) {
+			if (pointerFrame !== null) cancelAnimationFrame(pointerFrame)
+			pointerFrame = null
+			clearTimeout(pointerTimer)
+			pointerTimer = undefined
+			pendingPointer = null
+		}
 		ffLog(paused ? 'send ff-pause' : 'send ff-resume')
 		live2dFrame?.contentWindow?.postMessage({ type: paused ? 'ff-pause' : 'ff-resume' }, '*')
 	}
@@ -113,56 +126,90 @@
 		syncLive2d()
 	}
 
-	/** 进入/保持流畅模式：指针在看板娘上、或与它互动后的一段时间 */
+	/** 只保留一个休眠计时器，移动鼠标时延长截止时间，不反复创建计时器。 */
+	function checkLiveDeadline(): void {
+		graceTimer = undefined
+		const left = liveUntil - Date.now()
+		if (left > 0) graceTimer = setTimeout(checkLiveDeadline, left + 20)
+		else syncLive2d()
+	}
 	function refreshLive(ms = LIVE_GRACE_MS): void {
-		liveUntil = Date.now() + ms
+		liveUntil = Math.max(liveUntil, Date.now() + ms)
 		syncLive2d()
-		clearTimeout(graceTimer)
-		graceTimer = setTimeout(() => syncLive2d(), ms + 60)
+		if (!graceTimer) graceTimer = setTimeout(checkLiveDeadline, ms + 20)
 	}
 
-	// 光标跟随（全局常开）：把主窗口里的指针位置转发给看板娘 iframe。原项目里看板娘是页面
-	// 的一部分，光标在页面任何地方移动它都会看过来；放进 iframe 后 iframe 收不到外面的
-	// 指针事件，于是变成「只有鼠标进到侧栏里才跟随」。这里把坐标换算成 iframe 内的相对位置
-	// 转发过去（iframe 内部那一格由加载器自己的 pointermove 收，两条通道写同一个目标），
-	// 并在指针移动期间让看板娘保持活动 —— 停止移动 1.5 秒后回到「静止肖像」省电状态
+	// 高频鼠标输入合并为最新坐标；发送速率不超过模型实际需要的帧率。
 	let frameRect: DOMRect | null = null
 	let frameRectAt = 0
 	let sentX = Number.NaN
 	let sentY = Number.NaN
-	function forwardPointer(e: Event): void {
-		if (!live2dFrame) return
-		const ev = e as PointerEvent
-		if (typeof ev.clientX !== 'number') return
+	let pointerTimer: ReturnType<typeof setTimeout> | undefined
+	let pointerFrame: number | null = null
+	let pointerLastSentAt = Number.NEGATIVE_INFINITY
+	let pendingPointer: { x: number; y: number } | null = null
+	function flushPointer(): void {
+		pointerTimer = undefined
+		pointerFrame = null
+		if (!pendingPointer || !live2dFrame || anyPaused() || !globalFollow) return
 		const now = performance.now()
+		if (!hardwareLive2d && now - pointerLastSentAt < 1000 / 60 - 0.05) {
+			pointerFrame = requestAnimationFrame(() => flushPointer())
+			return
+		}
+		const point = pendingPointer
+		pendingPointer = null
 		if (!frameRect || now - frameRectAt > 250) {
 			frameRect = live2dFrame.getBoundingClientRect()
 			frameRectAt = now
 		}
-		const x = Math.round(ev.clientX - frameRect.left)
-		const y = Math.round(ev.clientY - frameRect.top)
-		// 只滤掉完全没动的重复事件：跟随的延迟直接由这里决定
+		const x = Math.round(point.x - frameRect.left)
+		const y = Math.round(point.y - frameRect.top)
 		if (x === sentX && y === sentY) return
 		sentX = x
 		sentY = y
+		pointerLastSentAt = now
+		refreshLive()
 		live2dFrame.contentWindow?.postMessage({ type: 'ff-pointer', x, y }, '*')
 	}
-
-	/** 指针移动/划过看板娘（侧栏）时进入流畅模式；停在上面不动超时同样转静止 */
-	function onPointerTrack(e: Event): void {
-		const el = e.target as Element | null
-		const over = !!(el && typeof el.closest === 'function' && el.closest('.sidebar'))
-		// 侧栏上（正看着它）：保持 8 秒流畅；窗口其它地方移动：只保持 1.5 秒，
-		// 让跟随不至于让看板娘一直渲染
-		refreshLive(over ? LIVE_GRACE_MS : 1500)
-		forwardPointer(e)
+	function onPointerTrack(e: PointerEvent): void {
+		if (!live2dFrame || anyPaused() || !globalFollow) return
+		pendingPointer = { x: e.clientX, y: e.clientY }
+		if (pointerTimer || pointerFrame !== null) return
+		if (hardwareLive2d) {
+			flushPointer()
+			return
+		}
+		pointerFrame = requestAnimationFrame(() => flushPointer())
 	}
+
+	function syncRenderMode(hardware = hardwareLive2d): void {
+		live2dFrame?.contentWindow?.postMessage({ type: 'ff-render-mode', hardware }, '*')
+	}
+	function clearResizeFreeze(): void {
+		document.body.classList.remove('ff-freeze')
+		const el = document.getElementById('app')
+		if (el) { el.style.width = ''; el.style.height = '' }
+		pausedByResize = false
+		syncLive2d()
+	}
+	$effect(() => {
+		document.documentElement.dataset.renderMode = hardwareUi ? 'hardware' : 'software'
+		if (hardwareUi) { clearTimeout(freezeTimer); clearResizeFreeze() }
+	})
+	$effect(() => {
+		const hardware = hardwareLive2d
+		syncRenderMode(hardware)
+	})
 
 	// iframe 重载后新文档不知道之前的指令，全部重发；并先流畅几秒让用户看到看板娘
 	function onLive2dLoad(): void {
 		ffLog('iframe-load')
+		frameRect = null
+		sentX = sentY = Number.NaN
+		syncRenderMode()
 		forcePauseSync()
-		refreshLive(6000)
+		refreshLive(hardwareLive2d ? 3000 : 1500)
 	}
 
 	// 拖拽分隔条时把看板娘画布尺寸钉住：否则侧栏宽度每变一次，WebGL 画布就重建一次，
@@ -187,6 +234,13 @@
 		const onResize = (): void => {
 			const on = window.innerHeight >= 700
 			if (on !== live2dOn) live2dOn = on
+			frameRect = null
+			if (hardwareUi) {
+				clearResizeFreeze()
+				clearTimeout(bakeTimer)
+				bakeTimer = setTimeout(() => void bakeBg(), 600)
+				return
+			}
 			const appEl = document.getElementById('app')
 			if (appEl && !document.body.classList.contains('ff-freeze')) {
 				document.body.classList.add('ff-freeze')
@@ -242,8 +296,7 @@
 		document.body.addEventListener('ff-dragstart', onDragStart)
 		document.body.addEventListener('ff-dragend', onDragEnd)
 		// 看板娘渲染策略：指针在侧栏上 → 流畅；离开一段时间 → 静止肖像（零 CPU）
-		window.addEventListener('pointerover', onPointerTrack, trackOpts)
-		window.addEventListener('mousemove', onPointerTrack, trackOpts)
+		window.addEventListener('pointermove', onPointerTrack, trackOpts)
 		window.addEventListener('blur', onBlur)
 		window.addEventListener('focus', onFocus)
 		syncLive2d()
@@ -251,8 +304,10 @@
 			window.removeEventListener('resize', onResize)
 			document.body.removeEventListener('ff-dragstart', onDragStart)
 			document.body.removeEventListener('ff-dragend', onDragEnd)
-			window.removeEventListener('pointerover', onPointerTrack, trackOpts)
-			window.removeEventListener('mousemove', onPointerTrack, trackOpts)
+			window.removeEventListener('pointermove', onPointerTrack, trackOpts)
+			clearTimeout(pointerTimer)
+			if (pointerFrame !== null) cancelAnimationFrame(pointerFrame)
+			pointerFrame = null
 			window.removeEventListener('blur', onBlur)
 			window.removeEventListener('focus', onFocus)
 			clearTimeout(freezeTimer)
@@ -278,6 +333,19 @@
 		} catch (e) {
 			notify(errMsg(e), false)
 		}
+	}
+
+	async function setGlobalFollow(v: boolean): Promise<void> {
+		try {
+			applyAppearance(await window.api.appearanceSet({ live2dGlobalFollow: v }))
+			if (!v) {
+				if (pointerFrame !== null) cancelAnimationFrame(pointerFrame)
+				pointerFrame = null
+				clearTimeout(pointerTimer)
+				pointerTimer = undefined
+				pendingPointer = null
+			}
+		} catch (e) { notify(errMsg(e), false) }
 	}
 
 	let toastMsg = $state('')
@@ -308,11 +376,12 @@
 	}
 
 	function live2dUrl(v: { s: number; x: number; y: number }): string {
-		return `live2d/embed.html?s=${v.s}&x=${v.x}&y=${v.y}`
+		return `live2d/embed.html?s=${v.s}&x=${v.x}&y=${v.y}&hw=${hardwareLive2d ? 1 : 0}`
 	}
 
 	async function init(): Promise<void> {
 		try {
+			// GPU 能力诊断不能阻塞主界面：部分驱动在 getGPUInfo('complete') 上可能长时间等待。
 			const s = await window.api.appInit()
 			if (s.appearance) applyAppearance(s.appearance)
 			wallpaperData = s.wallpaperData ?? null
@@ -323,12 +392,18 @@
 			}
 			live2dSrc = live2dUrl(live2dView)
 			phase = s.valid ? 'ready' : 'onboard'
+			void window.api
+				.gpuStatus()
+				.then((status) => { gpuStatus = status })
+				.catch(() => { /* GPU 诊断失败不影响界面 */ })
 		} catch {
 			phase = 'onboard'
 		}
 	}
-	$effect(() => {
+	onMount(() => {
+		const unsubscribe = window.api.onGpuStatus((status) => { gpuStatus = status })
 		void init()
+		return unsubscribe
 	})
 
 	// 看板娘视图：拖动/滚轮时先本地预览（只改容器尺寸与位移），停手 600ms 后才落盘
@@ -367,6 +442,7 @@
 	// 反向（父窗口 → iframe）：ff-pause / ff-resume、ff-live / ff-static、ff-pointer、ff-adjust
 	$effect(() => {
 		const onMsg = (e: MessageEvent): void => {
+			if (!live2dFrame || e.source !== live2dFrame.contentWindow) return
 			const d = (e.data || {}) as {
 				type?: string
 				s?: number
@@ -388,6 +464,8 @@
 			} else if (d.type === 'ff-art' && typeof d.ratio === 'number' && d.ratio > 0.2) {
 				// 看板娘报来模型实际内容的宽高比：让槽位高度正好等于模型高度
 				live2dRatio = d.ratio
+				syncRenderMode()
+				forcePauseSync()
 			} else if (d.type === 'ff-say') {
 				// 看板娘说话（欢迎语/摸头回应/动作台词）：空字符串 = 收起消息框
 				live2dSay = d.text ?? ''
@@ -395,6 +473,8 @@
 				// 看板娘要打开外链（🔗「了解流萤」）：交给主进程用系统浏览器打开 ——
 				// Electron 里 window.open 只会弹一个没有地址栏的裸窗口
 				void window.api.openExternal(d.url).catch((err) => notify(errMsg(err), false))
+			} else if (d.type === 'ff-hover') {
+				if (!anyPaused()) refreshLive()
 			} else if (d.type === 'ff-interact') {
 				// 与看板娘互动（点击/摸头/按钮）：恢复流畅渲染一段时间
 				refreshLive(12_000)
@@ -498,6 +578,9 @@
 		{setCardOpacity}
 		{setSidebarOpacity}
 		{setLive2dEnabled}
+		{setGlobalFollow}
+		{globalFollow}
+		{gpuStatus}
 		{appearance}
 		view={live2dView}
 		onChangeLive2d={changeLive2d}

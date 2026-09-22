@@ -278,6 +278,7 @@
   async function boot() {
     loadStyle(asset(cfg.css));
 
+    await loadScript(asset("load/frame-pacer.js"), () => !!window.FireflyFramePacer);
     await loadScript(asset(cfg.core), () => !!window.Live2DCubismCore);
     await loadScript(asset(cfg.pixi), () => !!window.PIXI);
     await loadScript(asset(cfg.live2d), () => !!window.PIXI?.live2d?.Live2DModel);
@@ -332,51 +333,31 @@
       autoStart: false,
     });
 
-    // ===== 自建渲染节拍器（省 CPU 的核心）=====
-    // 两个必须自己来的原因（实测）：
-    // 1) PIXI 5.3.6 的 Ticker 并未实现 maxFPS 限帧（属性存在但引擎从不读取），
-    //    直接用它会让看板娘以浏览器 rAF 满帧（60fps）渲染；
-    // 2) 更关键：requestAnimationFrame 每次都会让页面产生一个合成帧，软件渲染下每帧
-    //    整窗重新合成 ≈ 2 个 CPU 核 —— 所以节拍不能用 rAF，必须用 setTimeout，
-    //    并且模型的自动更新也要关掉（它挂在 Ticker.shared 的 rAF 上，同样持续产帧）。
-    // 现在：只按目标帧率渲染/更新，暂停时一帧都不排。
-    let targetFps = Math.min(60, Math.max(1, Number(cfg.maxFPS) || 15));
-    let frameMs = 1000 / targetFps;
+    // CPU 渲染下不能让 Pixi 的 InteractionManager 自己挂一条 system ticker rAF；
+    // 事件仍然收集，但由下面的自建帧节拍器逐帧调用 interaction.update()。
+    const interactionManager = app.renderer?.plugins?.interaction;
+    if (interactionManager) interactionManager.useSystemTicker = false;
+
+    // 硬件和软件模式都跟随显示节拍；软件模式在每个显示帧上限 60 帧，静止时都不排帧。
+    let hardwareRendering = cfg.hardware === true;
+    let targetFps = Math.min(60, Math.max(1, Number(cfg.maxFPS) || 60));
     let renderPaused = false;
-    let paceTimer = 0;
-    let lastTick = 0;
     window.__ffRenderFrames = 0;
 
-    // ===== 跟随期间临时提帧 =====
-    // 软件渲染下帧率就是 CPU，所以平时固定 15 帧。但光标跟随是另一回事：视线缓动明明
-    // 是连续的，15 帧下却每 66ms 才动一下，观感就是「追不上、发涩」（原项目/网页插件
-    // 跑 60 帧，没有这个问题）。这里在「指针正在动」的那一小段时间里按 FOLLOW_FPS 渲染，
-    // 指针停下 FOLLOW_WINDOW_MS 之后自动回到基础帧率（再由静止肖像策略彻底停住）
-    const FOLLOW_FPS = 30;
-    const FOLLOW_WINDOW_MS = 300;
-    let followUntil = 0;
-    /** 当前该用的帧间隔：指针刚动过就用提帧，否则用基础帧率 */
-    const activeFrameMs = () => (performance.now() < followUntil ? 1000 / FOLLOW_FPS : frameMs);
-    /** 标记「指针刚动过」：视线目标每次更新时调用 */
-    const markFollowActive = () => {
-      followUntil = performance.now() + FOLLOW_WINDOW_MS;
-    };
-
-    const scheduleNext = () => {
-      const wait = Math.max(4, activeFrameMs() - (performance.now() - lastTick));
-      paceTimer = window.setTimeout(tick, wait);
-    };
-    // 手动推进 PIXI 共享 Ticker —— 这一条是「鼠标追踪 + 命中动作 + 表情」能用的前提：
-    // PIXI 5 的交互系统把指针事件队列挂在 Ticker.shared 上处理，库的「看向鼠标」和
-    // pointertap 命中派发也走这条路。此前直接 stop() 掉共享 Ticker 等于把这些全关了
+    // 手动推进共享 Ticker 与 InteractionManager —— 这是「鼠标追踪 + 命中动作 + 表情」能用的前提：
+    // InteractionManager 的 system ticker 已关闭，事件处理和模型动作都在当前帧统一推进。此前直接 stop() 掉共享 Ticker 等于把这些全关了
     // （症状：鼠标挪动时流萤不看人、部分动作点不出来、表情全部无效）。
     // 这里不重启它的 rAF 循环（那会 60fps 空转吃 CPU），只按我们的节拍手动 update：
-    // 功能恢复，帧率仍由省电策略决定
+    // 功能恢复；软件模式由帧调度器限制到 60 帧，硬件模式接受每个显示回调
     const tickSharedTicker = () => {
       try {
         const shared = PIXI.Ticker && PIXI.Ticker.shared;
         if (shared && !shared.started && typeof shared.update === "function") {
           shared.update(performance.now());
+        }
+        const interaction = app.renderer?.plugins?.interaction;
+        if (interaction && typeof interaction.update === "function") {
+          interaction.update();
         }
       } catch (error) {
         log("shared ticker update failed", error);
@@ -386,7 +367,7 @@
     // 互动「尾随保活」：点了看板娘、动作还在播时不能立刻停帧 ——
     // 否则动作演到一半画面冻住，看起来就像「点了没反应，得去点别的页面才刷新」
     const MOTION_TAIL_MS = 6000;
-    let lastInteractAt = 0;
+    let lastInteractAt = -Infinity;
 
     // ===== 光标跟随：直接用库自带的缓动（= 原项目的灵敏度）=====
     // 早先这里换过一版「快速跟随」（指数逼近 + 线性追赶），实测 62~153ms 到位，
@@ -404,7 +385,7 @@
       if (!model || typeof model.focus !== "function") return;
       try {
         model.focus(px, py);
-        markFollowActive(); // 跟随期间提帧，指针停下 300ms 后自动回落
+        startPacer(); // 静止后也能响应 iframe 内的指针移动，帧率由当前模式控制
         gazeSetAt = performance.now();
         gazeRespMs = -1;
       } catch (error) {
@@ -426,16 +407,9 @@
       }
       return settled;
     };
-    const tick = () => {
-      if (destroyed || renderPaused) return;
-      const now = performance.now();
-      // 单位必须是毫秒：库自己的 ticker 路径就是 model.update(deltaMS)，
-      // 内部 elapsedTime 也从 performance.now() 起累加毫秒。此前按「秒」传
-      // （dt≈0.066）会让所有依赖 dt 的平滑慢 1000 倍 —— 表现就是「鼠标追踪
-      // 几乎不动、表情淡入永远看不见」（用户反馈的「不看人 / 表情全部失效」）。
-      // 动作是相对时间比较，所以当时看着还能播，掩盖了这个问题
-      const dt = lastTick ? Math.min(100, now - lastTick) : 1000 / 60;
-      lastTick = now;
+    const tick = (dt, now) => {
+      if (destroyed || renderPaused) return false;
+      // 调度器提供毫秒增量；恢复时重置时钟，避免动作突然跳变。
       window.__ffRenderFrames += 1;
       tickSharedTicker();
       let t0 = performance.now();
@@ -459,21 +433,11 @@
       window.__ffUpdateMs = Math.round(((window.__ffUpdateMs || 0) * 9 + (t1 - t0)) / 10);
       window.__ffRenderMs = Math.round(((window.__ffRenderMs || 0) * 9 + (t2 - t1)) / 10);
       const keepAlive = now - lastInteractAt < MOTION_TAIL_MS;
-      if (paceMode === "live" || keepAlive) {
-        scheduleNext();
-      } else if (!gazeOk) {
-        // 视线还没贴住目标：再多渲染一帧，免得定格在「头转到一半」的样子。
-        // 注意这里不再把视线收回正前方 —— 光标停在窗口某个位置时，流萤保持看着他，
-        // 这才和原项目一致（收回正前方会让「停住不动」看起来像突然走神）
-        scheduleNext();
-      } else {
-        paceTimer = 0; // 静止肖像：渲染完这帧就停，不再排帧
-      }
+      return paceMode === "live" || keepAlive || !gazeOk;
     };
+    const pacer = window.FireflyFramePacer({ hardware: hardwareRendering, fps: targetFps, onFrame: tick });
     const startPacer = () => {
-      if (paceTimer || destroyed || renderPaused) return;
-      lastTick = 0;
-      tick();
+      if (!destroyed && !renderPaused) pacer.start();
     };
     startPacer();
 
@@ -1356,7 +1320,13 @@
     // 光标跟随（iframe 内）：指针在看板娘这一格里移动时也更新视线目标。
     // 鼠标划过 iframe 时父窗口收不到事件（跨文档不冒泡），这一段只能由 iframe 自己收，
     // 剩下的窗口区域由管理器转发（ff-pointer → FireflyLive2D.focus），两条通道写同一个目标
+    let hoverSentAt = -Infinity;
     document.addEventListener("pointermove", (event) => {
+      const now = performance.now();
+      if (cfg.embed && now - hoverSentAt >= 200) {
+        hoverSentAt = now;
+        window.parent.postMessage({ type: "ff-hover" }, "*");
+      }
       const rect = canvas.getBoundingClientRect();
       if (!rect.width || !rect.height) return;
       focusGaze(
@@ -1996,8 +1966,7 @@
         if (next === renderPaused) return;
         renderPaused = next;
         if (next) {
-          clearTimeout(paceTimer);
-          paceTimer = 0;
+          pacer.stop();
         } else if (paceMode === "live") {
           startPacer();
         }
@@ -2005,8 +1974,7 @@
       get paused() { return renderPaused; },
       /**
        * 流畅 / 静止肖像：静止时停在最后一帧（画面仍是看板娘，只是不再逐帧渲染）。
-       * 实测每渲染一帧固定消耗 90~130ms CPU（软件光栅化管线的开销），
-       * 所以「不看着它就完全不渲染」是这台机器上唯一有效的省电手段
+       * 不需要动画时保留最后一帧，避免持续唤醒软件图形管线。
        */
       setLive(live) {
         const next = live ? "live" : "static";
@@ -2019,8 +1987,20 @@
         // 继续渲染，动作演完或超时后自然停在最后一帧
       },
       get live() { return paceMode === "live"; },
-      /** 生效中的帧率（指针刚动过时是提帧后的 30，否则是基础 15） */
-      get activeFps() { return Math.round(1000 / activeFrameMs()); },
+      /** 软件模式的上限；硬件模式不设置人工帧率上限，诊断值 0 表示 uncapped。 */
+      get activeFps() { return hardwareRendering ? 0 : targetFps; },
+      setRenderMode(hardware) {
+        hardwareRendering = !!hardware;
+        targetFps = 60;
+        pacer.setMode(hardwareRendering, targetFps);
+        const resolution = cfg.resolutionOverride ? cfg.resolution : hardwareRendering ? Math.min(2, window.devicePixelRatio || 1) : 0.8;
+        if (app.renderer.resolution !== resolution) {
+          cfg.resolution = resolution;
+          app.renderer.resolution = resolution;
+          app.renderer.resize(layout.width, layout.height);
+          refreshRenderer();
+        }
+      },
       /**
        * 光标跟随：入参是画布内的像素坐标（管理器把主窗口的光标位置换算成 iframe 内坐标转发过来）。
        * 目标只在这里登记，实际的平滑与写回由渲染帧里的 applyGaze() 完成
@@ -2051,13 +2031,13 @@
         model.tap(center.x + center.width / 2, center.y + center.height / 2);
         return true;
       },
-      /** 调整渲染帧率（软件渲染下帧率≈CPU 占用） */
+      /** 调整 CPU 软件渲染的帧率上限；GPU 模式忽略人工上限。 */
       setFps(fps) {
-        const next = Math.min(60, Math.max(1, Number(fps) || 15));
+        const next = Math.min(60, Math.max(1, Number(fps) || 60));
         targetFps = next;
-        frameMs = 1000 / next;
+        pacer.setMode(hardwareRendering, targetFps);
       },
-      get fps() { return targetFps; },
+      get fps() { return hardwareRendering ? 0 : targetFps; },
       show() {
         setHidden(false);
         say("我回来啦~");
@@ -2168,7 +2148,7 @@
             fit: model && model.scale ? Math.round(model.scale.x * 1000) / 1000 : null,
             pos: model ? [Math.round(model.x), Math.round(model.y)] : null,
             box: [layout.width, layout.height],
-            fps: Math.round(1000 / activeFrameMs()), // 当前生效帧率（跟随期间是提帧后的）
+            fps: hardwareRendering ? 0 : targetFps, // 0 = GPU 模式不设人工帧率上限
             res: app && app.renderer ? app.renderer.resolution : null,
             expr: lastExpressionName,
             params: ["ParamEyeLOpen","ParamEyeROpen","ParamMouthForm","ParamMouthOpenY","ParamBrowLY","ParamBrowRY","ParamAngleX","ParamAngleZ"].map(param)
@@ -2180,8 +2160,7 @@
       destroy() {
         destroyed = true;
         actionSerial += 1;
-        clearTimeout(paceTimer);
-        paceTimer = 0;
+        pacer.stop();
         clearTimeout(resizeTimer);
         window.removeEventListener("resize", onResize);
         window.visualViewport?.removeEventListener("resize", onResize);

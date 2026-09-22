@@ -58,6 +58,8 @@ export interface AppearanceSettings {
 	wallpaper?: string
 	/** 是否显示侧栏看板娘（关掉后拖拽/缩放更流畅） */
 	live2dEnabled?: boolean
+	/** 全窗口鼠标跟随；未设置时，硬件模式开启、软件模式关闭 */
+	live2dGlobalFollow?: boolean
 	/** 看板娘缩放，1 = 原项目初始值 */
 	live2dScale?: number
 	/** 看板娘水平 / 垂直偏移（像素），叠加在原项目初始值之上 */
@@ -110,4 +112,13 @@ export interface NetworkFailure {
 export interface DataDirInfo {
 	dataDir: string
 	isCustom: boolean
+}
+
+/** 用户选择与当前实际渲染能力分别报告，不能用设置值代替 GPU 检测。 */
+export type RenderBackend = 'hardware' | 'software' | 'unavailable' | 'unknown'
+export interface GpuStatus {
+	requestedHardware: boolean
+	webgl: RenderBackend
+	compositing: RenderBackend
+	renderer: string
 }

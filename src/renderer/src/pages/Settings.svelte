@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { getContext, onMount } from 'svelte'
-	import type { AppearanceSettings, DataDirInfo } from '../lib/api'
+	import type { AppearanceSettings, DataDirInfo, GpuStatus } from '../lib/api'
 	import Slider from '../components/Slider.svelte'
 	import { errMsg } from '../lib/err'
 
@@ -9,10 +9,13 @@
 		setWallpaper: () => Promise<void>
 		clearWallpaper: () => Promise<void>
 		setAccent: (name: string, accent: string, deep: string) => Promise<void>
-		setDim: (v: number) => Promise<void>
-		setCardOpacity: (v: number) => Promise<void>
-		setSidebarOpacity: (v: number) => Promise<void>
+		setDim: (v: number) => void
+		setCardOpacity: (v: number) => void
+		setSidebarOpacity: (v: number) => void
 		setLive2dEnabled: (v: boolean) => Promise<void>
+		setGlobalFollow: (v: boolean) => Promise<void>
+		globalFollow: boolean
+		gpuStatus: GpuStatus
 		appearance: AppearanceSettings
 		view: { s: number; x: number; y: number }
 		onChangeLive2d: (v: { s: number; x: number; y: number }) => void
@@ -26,6 +29,9 @@
 		setCardOpacity,
 		setSidebarOpacity,
 		setLive2dEnabled,
+		setGlobalFollow,
+		globalFollow,
+		gpuStatus,
 		appearance,
 		view: live2dView = { s: 1, x: 0, y: 0 },
 		onChangeLive2d
@@ -34,15 +40,8 @@
 	let path = $state('')
 	let busy = $state(false)
 	let dirInfo = $state<DataDirInfo | null>(null)
-	let hwGpu = $state(false)
+	const backendLabel = { hardware: '硬件加速', software: '软件渲染', unavailable: '不可用', unknown: '检测中' } as const
 	const notify = getContext<(m: string, ok?: boolean) => void>('notify')
-
-	onMount(() => {
-		void window.api
-			.gpuStatus()
-			.then((v) => (hwGpu = v))
-			.catch(() => {})
-	})
 
 	async function toggleGpu(on: boolean): Promise<void> {
 		try {
@@ -211,11 +210,17 @@
 <div class="card" style="margin-top:14px">
 	<h3>⚡ 渲染模式（实验）</h3>
 	<p class="muted">
-		默认软件渲染：兼容性最好，但界面合成与看板娘都走 CPU，拖拽和动画在部分机器上会吃力。开启后允许 GPU 独立进程参与渲染，若你的显卡驱动兼容会明显更流畅、CPU 大幅下降；若驱动异常，画面会自动回落软件渲染（看板娘可能暂时不显示），<b>关掉本开关重启即可恢复</b>。
+		开启后尝试使用显卡加速；软件模式优先减少后台动画。切换需要重启，实际是否生效以下方检测结果为准。
+	</p>
+	<p class="hint" aria-live="polite">
+		当前界面合成：<b>{backendLabel[gpuStatus.compositing]}</b> · 看板娘：<b>{backendLabel[gpuStatus.webgl]}</b>
+		{#if gpuStatus.requestedHardware && gpuStatus.webgl === 'software'}
+			<br />当前已回退软件渲染，自动使用节能策略。
+		{/if}
 	</p>
 	<div class="row" style="margin-top:8px">
 		<label class="l2d-switch">
-			<input type="checkbox" checked={hwGpu} onchange={(e) => toggleGpu((e.target as HTMLInputElement).checked)} />
+			<input type="checkbox" checked={gpuStatus.requestedHardware} onchange={(e) => toggleGpu((e.target as HTMLInputElement).checked)} />
 			<span>硬件加速渲染（点击后自动重启生效）</span>
 		</label>
 	</div>
@@ -239,12 +244,17 @@
 		</div>
 	</div>
 	{#if appearance.live2dEnabled !== false}
+		<label class="l2d-switch">
+			<input type="checkbox" checked={globalFollow} onchange={(e) => setGlobalFollow((e.target as HTMLInputElement).checked)} />
+			<span>全窗口鼠标跟随</span>
+		</label>
 		<p class="hint">
-			<b>光标跟随（常开）</b>：鼠标在整个窗口里移动，流萤都会看过来 —— 与原项目一致。
-			视线缓动就是原项目那套（加载器不做任何加速）：跨半屏的移动实测约 0.3~0.4 秒平滑转过去，小幅移动 0.1 秒内就跟上。
-			软件渲染下看板娘每帧都由 CPU 绘制，所以采用「静止肖像」策略：
-			<b>鼠标停下 1.5 秒后就不再渲染</b>（画面仍是流萤，只是不动，视线停在你最后所在的位置，CPU 归零）。
-			代价：移动鼠标期间看板娘保持动画（指针移动时 30 帧，停下 0.3 秒回落到基础 15 帧），软件渲染实测连续移动约 3 核。
+			开启后，在内容区移动鼠标也会唤醒看板娘；关闭后仍可在看板娘区域跟随、点击和播放动作。
+			未手动设置时，硬件模式默认开启，软件模式默认关闭。
+		</p>
+		<p class="hint">
+			CPU 软件渲染限制在最高 60 帧，并使用较低分辨率减少单帧成本；GPU 渲染不设置人工帧率上限。
+			停止移动后自动定格，点击动作会保留播放时间；窗口失焦或拖拽时暂停。
 		</p>
 		<Slider
 			label="模型大小"
